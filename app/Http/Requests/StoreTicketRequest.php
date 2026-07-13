@@ -18,8 +18,8 @@ class StoreTicketRequest extends FormRequest
         return [
             'title' => ['required', 'string', 'min:3', 'max:255'],
             'description' => ['required', 'string', 'min:3', 'max:200'],
-            'category' => ['required', 'string', 'in:hardware,software,network,account'],
-            'priority' => ['required', 'string', 'in:low,medium,high'],
+            'category' => ['required', 'string', 'in:Hardware,Software,Network,Account'],
+            'priority' => ['required', 'string', 'in:Low,Medium,High'],
             'created_by' => ['required', 'string', 'max:255'],
             'attachment' => ['nullable', 'string', 'max:255'],
         ];
@@ -31,8 +31,8 @@ class StoreTicketRequest extends FormRequest
         return [
             'title.required' => 'A ticket title is required.',
             'description.required' => 'A description is required.',
-            'category.in' => 'Category must be hardware, software, network, or account.',
-            'priority.in' => 'Priority must be low, medium, or high.',
+            'category.in' => 'Category must be Hardware, Software, Network, or Account.',
+            'priority.in' => 'Priority must be Low, Medium, or High.',
         ];
     }
 }

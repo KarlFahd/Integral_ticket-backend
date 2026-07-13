@@ -3,10 +3,13 @@
 namespace App\Http\Controllers\Api;
 
 use App\DTO\StoreMessageDTO;
+use App\Events\MessageSent;
+use App\Events\TicketNotificationCreated;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreMessageRequest;
 use App\Http\Resources\TicketMessageResource;
 use App\Services\TicketMessageService;
+use App\Services\TicketNotificationService;
 use App\Services\TicketService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
@@ -16,6 +19,7 @@ class MessageController extends Controller
     public function __construct(
         private readonly TicketService $ticketService,
         private readonly TicketMessageService $messageService,
+        private readonly TicketNotificationService $notificationService,
     ) {}
 
     public function index(int $id): AnonymousResourceCollection|JsonResponse
@@ -41,6 +45,14 @@ class MessageController extends Controller
 
         $dto     = StoreMessageDTO::fromArray($request->validated());
         $message = $this->messageService->createMessage($id, $dto);
+
+        broadcast(new MessageSent($message))->toOthers();
+
+        $notifications = $this->notificationService->notifyForNewMessage($message, $ticket);
+
+        foreach ($notifications as $notification) {
+            broadcast(new TicketNotificationCreated($notification, $notification->user->username));
+        }
 
         return (new TicketMessageResource($message))->response()->setStatusCode(201);
     }

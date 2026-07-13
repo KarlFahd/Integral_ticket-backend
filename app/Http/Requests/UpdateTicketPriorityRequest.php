@@ -16,7 +16,7 @@ class UpdateTicketPriorityRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'priority' => ['required', 'string', 'in:low,medium,high'],
+            'priority' => ['required', 'string', 'in:Low,Medium,High'],
         ];
     }
 
@@ -24,7 +24,7 @@ class UpdateTicketPriorityRequest extends FormRequest
     public function messages(): array
     {
         return [
-            'priority.in' => 'Priority must be low, medium, or high.',
+            'priority.in' => 'Priority must be Low, Medium, or High.',
         ];
     }
 }

@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\DTO\StoreTicketDTO;
 use App\DTO\UpdateTicketStatusDTO;
+use App\Events\TicketUpdated;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\StoreTicketRequest;
 use App\Http\Requests\UpdateTicketPriorityRequest;
@@ -57,6 +58,8 @@ class TicketController extends Controller
             UpdateTicketStatusDTO::fromArray($request->validated())
         );
 
+        broadcast(new TicketUpdated($updated));
+
         return new TicketResource($updated);
     }
 
@@ -72,6 +75,8 @@ class TicketController extends Controller
             $ticket,
             $request->validated()['priority']
         );
+
+        broadcast(new TicketUpdated($updated));
 
         return new TicketResource($updated);
     }

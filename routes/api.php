@@ -1,13 +1,17 @@
 <?php
 
 use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\BotController;
 use App\Http\Controllers\Api\MessageController;
+use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\TicketController;
 use App\Http\Controllers\Api\TwoFactorController;
 use App\Http\Controllers\Api\UserController;
 use Illuminate\Support\Facades\Route;
 
 Route::post('/login', [AuthController::class, 'login']);
+
+Route::post('/bot/chat', [BotController::class, 'chat']);
 
 Route::prefix('2fa')->group(function () {
     Route::post('/setup',   [TwoFactorController::class, 'setup']);
@@ -30,4 +34,10 @@ Route::prefix('tickets')->group(function () {
     Route::patch('/{id}/priority', [TicketController::class, 'updatePriority']);
     Route::get('/{id}/messages', [MessageController::class, 'index']);
     Route::post('/{id}/messages', [MessageController::class, 'store']);
+});
+
+Route::prefix('notifications')->group(function () {
+    Route::get('/', [NotificationController::class, 'index']);
+    Route::delete('/ticket/{ticketId}', [NotificationController::class, 'clearForTicket']);
+    Route::delete('/{id}', [NotificationController::class, 'clear']);
 });

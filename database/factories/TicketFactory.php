@@ -16,8 +16,8 @@ class TicketFactory extends Factory
         return [
             'title' => $this->faker->sentence(4),
             'description' => $this->faker->paragraph(),
-            'category' => $this->faker->randomElement(['hardware', 'software', 'network', 'account']),
-            'priority' => $this->faker->randomElement(['low', 'medium', 'high']),
+            'category' => $this->faker->randomElement(['Hardware', 'Software', 'Network', 'Account']),
+            'priority' => $this->faker->randomElement(['Low', 'Medium', 'High']),
             'status' => 'Open',
             'attachment' => null,
             'created_by' => $this->faker->userName(),
