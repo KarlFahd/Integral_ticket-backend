@@ -32,6 +32,7 @@ Route::prefix('tickets')->group(function () {
     Route::get('/{id}', [TicketController::class, 'show']);
     Route::patch('/{id}/status', [TicketController::class, 'updateStatus']);
     Route::patch('/{id}/priority', [TicketController::class, 'updatePriority']);
+    Route::delete('/{id}', [TicketController::class, 'destroy']);
     Route::get('/{id}/messages', [MessageController::class, 'index']);
     Route::post('/{id}/messages', [MessageController::class, 'store']);
 });

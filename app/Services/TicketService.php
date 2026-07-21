@@ -38,4 +38,9 @@ class TicketService
     {
         return $this->ticketRepository->updatePriority($ticket, $priority);
     }
+
+    public function deleteTicket(Ticket $ticket): void
+    {
+        $this->ticketRepository->delete($ticket);
+    }
 }

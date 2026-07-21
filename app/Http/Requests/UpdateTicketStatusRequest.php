@@ -16,7 +16,7 @@ class UpdateTicketStatusRequest extends FormRequest
     public function rules(): array
     {
         return [
-            'status' => ['required', 'string', 'in:Open,Pending,In Progress,Approved,Rejected,Resolved'],
+            'status' => ['required', 'string', 'in:Open,Pending,In Progress,Rejected,Resolved'],
         ];
     }
 
@@ -24,7 +24,7 @@ class UpdateTicketStatusRequest extends FormRequest
     public function messages(): array
     {
         return [
-            'status.in' => 'Status must be one of: Open, Pending, In Progress, Approved, Rejected, Resolved.',
+            'status.in' => 'Status must be one of: Open, Pending, In Progress, Rejected, Resolved.',
         ];
     }
 }

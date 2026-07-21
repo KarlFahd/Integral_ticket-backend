@@ -12,6 +12,7 @@ use App\Models\Ticket;
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
@@ -30,7 +31,7 @@ class BotService
 
     private const PRIORITIES = ['Low', 'Medium', 'High'];
 
-    private const STATUSES = ['Open', 'Pending', 'In Progress', 'Approved', 'Rejected', 'Resolved'];
+    private const STATUSES = ['Open', 'Pending', 'In Progress', 'Rejected', 'Resolved'];
 
     public function __construct(
         private readonly TicketService $ticketService,
@@ -70,6 +71,11 @@ class BotService
             }
 
             if ($response->failed()) {
+                Log::warning('BotService: Gemini request failed', [
+                    'status' => $response->status(),
+                    'body' => $response->body(),
+                ]);
+
                 return [
                     'reply' => 'Integral Bot ran into a problem talking to Gemini. Please try again in a moment.',
                     'actions' => $actions,
@@ -197,7 +203,7 @@ class BotService
         - If a tool needs information the user hasn't given you, ask one short, specific clarifying question instead of guessing or calling the tool with made-up values.
         - Ticket categories are exactly: Hardware, Software, Network, Account.
         - Ticket priorities are exactly: Low, Medium, High.
-        - Ticket statuses are exactly: Open, Pending, In Progress, Approved, Rejected, Resolved.
+        - Ticket statuses are exactly: Open, Pending, In Progress, Rejected, Resolved.
         - Never invent ticket IDs, usernames, or data — only reference what tool results actually return to you.
         - Keep replies short and conversational (one to three sentences), not a report.
         - You only see and act on what the current user is allowed to see and act on in the app itself — don't apologize for that, just work within it.
@@ -214,13 +220,18 @@ class BotService
             $navigateTargets[] = 'finance';
         }
 
+        if ($isAdmin) {
+            $navigateTargets[] = 'history';
+        }
+
         $tools = [
             [
                 'name' => 'navigate',
                 'description' => 'Open a page in the app for the user (client-side navigation). '
                     .'These names match the sidebar labels exactly: "dashboard" is the home/overview page with ticket stats, '
                     .'"tickets" is the ticket list page, "create-ticket" is the new-ticket form, "2fa-setup" is the two-factor '
-                    .'authentication setup page. "dashboard" and "tickets" are NOT the same page — pick the one the user actually means.',
+                    .'authentication setup page, "history" is the admin-only archive of resolved tickets (separate from "tickets", '
+                    .'which never shows resolved tickets). "dashboard" and "tickets" are NOT the same page — pick the one the user actually means.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
@@ -305,7 +316,7 @@ class BotService
             ],
             [
                 'name' => 'reply_to_ticket',
-                'description' => 'Post a reply message on a ticket.',
+                'description' => 'Post a reply message on a single ticket.',
                 'parameters' => [
                     'type' => 'object',
                     'properties' => [
@@ -313,6 +324,27 @@ class BotService
                         'message' => ['type' => 'string', 'description' => 'Message text, max 1000 characters.'],
                     ],
                     'required' => ['ticket_id', 'message'],
+                ],
+            ],
+            [
+                'name' => 'bulk_reply_to_tickets',
+                'description' => 'Post the SAME reply message to every ticket matching the given filters — use this '
+                    .'instead of calling reply_to_ticket once per ticket whenever the user asks to message "all tickets" '
+                    .'matching some condition (e.g. "message every High priority ticket", "send this to all tickets with '
+                    .'ID under 10"). At least one filter (status, priority, min_id, or max_id) is required — refuse and '
+                    .'ask for a filter if the user wants it sent to literally every ticket with no condition at all. '
+                    .'Resolved tickets are always excluded, even if the filters would otherwise match them — they\'re '
+                    .'archived in the History page and considered done, so they never receive bulk messages.',
+                'parameters' => [
+                    'type' => 'object',
+                    'properties' => [
+                        'message' => ['type' => 'string', 'description' => 'Message text, max 1000 characters.'],
+                        'status' => ['type' => 'string', 'enum' => self::STATUSES, 'description' => 'Optional filter: only tickets with this status.'],
+                        'priority' => ['type' => 'string', 'enum' => self::PRIORITIES, 'description' => 'Optional filter: only tickets with this priority.'],
+                        'min_id' => ['type' => 'integer', 'description' => 'Optional filter: only tickets with an ID greater than this.'],
+                        'max_id' => ['type' => 'integer', 'description' => 'Optional filter: only tickets with an ID less than this.'],
+                    ],
+                    'required' => ['message'],
                 ],
             ],
         ];
@@ -362,6 +394,7 @@ class BotService
             'update_ticket_status' => $this->toolUpdateTicketStatus($input, $username, $isAdmin),
             'update_ticket_priority' => $this->toolUpdateTicketPriority($input, $username, $isAdmin),
             'reply_to_ticket' => $this->toolReplyToTicket($input, $username, $isAdmin),
+            'bulk_reply_to_tickets' => $this->toolBulkReplyToTickets($input, $username, $isAdmin),
             'create_user' => ($isAdmin || $isHr)
                 ? $this->toolCreateUser($input)
                 : ['You do not have permission to create users.', null],
@@ -388,6 +421,7 @@ class BotService
             'create-ticket' => '/create-ticket',
             'users' => '/users',
             'finance' => '/finance',
+            'history' => '/history',
         ];
 
         $page = (string) ($input['page'] ?? '');
@@ -552,10 +586,79 @@ class BotService
             return [$this->firstError($validator), null];
         }
 
+        $this->postTicketMessage($ticket, $username, $isAdmin, $validator->validated()['message']);
+
+        return ["Reply posted on ticket #{$ticket->id}.", null];
+    }
+
+    /** @param array<string, mixed> $input */
+    private function toolBulkReplyToTickets(array $input, string $username, bool $isAdmin): array
+    {
+        $validator = Validator::make($input, [
+            'message' => ['required', 'string', 'max:1000'],
+            'status' => ['nullable', 'string', 'in:'.implode(',', self::STATUSES)],
+            'priority' => ['nullable', 'string', 'in:'.implode(',', self::PRIORITIES)],
+            'min_id' => ['nullable', 'integer'],
+            'max_id' => ['nullable', 'integer'],
+        ]);
+
+        if ($validator->fails()) {
+            return [$this->firstError($validator), null];
+        }
+
+        $data = $validator->validated();
+
+        if (! isset($data['status']) && ! isset($data['priority']) && ! isset($data['min_id']) && ! isset($data['max_id'])) {
+            return ['Please give me at least one filter (status, priority, or a ticket ID range) so I know which tickets to message — I won\'t broadcast to every single ticket.', null];
+        }
+
+        $tickets = $this->ticketService->getAllTickets();
+
+        // Resolved tickets are archived in the History page — they're done,
+        // so bulk messages never target them even if a filter would otherwise match.
+        $tickets = $tickets->where('status', '!=', 'Resolved');
+
+        if (! $isAdmin) {
+            $tickets = $tickets->where('created_by', $username);
+        }
+
+        if (isset($data['status'])) {
+            $tickets = $tickets->where('status', $data['status']);
+        }
+
+        if (isset($data['priority'])) {
+            $tickets = $tickets->where('priority', $data['priority']);
+        }
+
+        if (isset($data['min_id'])) {
+            $tickets = $tickets->where('id', '>', $data['min_id']);
+        }
+
+        if (isset($data['max_id'])) {
+            $tickets = $tickets->where('id', '<', $data['max_id']);
+        }
+
+        if ($tickets->isEmpty()) {
+            return ['No tickets matched those filters — nothing was sent.', null];
+        }
+
+        $tickets = $tickets->take(50);
+
+        foreach ($tickets as $ticket) {
+            $this->postTicketMessage($ticket, $username, $isAdmin, $data['message']);
+        }
+
+        $count = $tickets->count();
+
+        return ["Sent the message to {$count} ticket".($count === 1 ? '' : 's').': '.$tickets->map(fn (Ticket $t) => "#{$t->id}")->implode(', ').'.', null];
+    }
+
+    private function postTicketMessage(Ticket $ticket, string $username, bool $isAdmin, string $text): void
+    {
         $dto = StoreMessageDTO::fromArray([
             'sender' => $username,
             'is_agent' => $isAdmin,
-            'message' => $validator->validated()['message'],
+            'message' => $text,
         ]);
 
         $message = $this->messageService->createMessage($ticket->id, $dto);
@@ -566,8 +669,6 @@ class BotService
         foreach ($notifications as $notification) {
             broadcast(new TicketNotificationCreated($notification, $notification->user->username));
         }
-
-        return ["Reply posted on ticket #{$ticket->id}.", null];
     }
 
     /** @param array<string, mixed> $input */

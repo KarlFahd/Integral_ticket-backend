@@ -61,4 +61,9 @@ class TicketRepository implements TicketRepositoryInterface
 
         return $ticket->fresh(['statusHistories']);
     }
+
+    public function delete(Ticket $ticket): void
+    {
+        $ticket->delete();
+    }
 }
