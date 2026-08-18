@@ -34,9 +34,9 @@ class TicketService
         return $this->ticketRepository->updateStatus($ticket, $dto);
     }
 
-    public function updateTicketPriority(Ticket $ticket, string $priority): Ticket
+    public function updateTicketPriority(Ticket $ticket, int $priorityId): Ticket
     {
-        return $this->ticketRepository->updatePriority($ticket, $priority);
+        return $this->ticketRepository->updatePriority($ticket, $priorityId);
     }
 
     public function deleteTicket(Ticket $ticket): void

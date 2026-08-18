@@ -39,4 +39,29 @@ return [
         'api_key' => env('GEMINI_API_KEY'),
     ],
 
+    'mcp' => [
+        // Shared secret McpController checks on every request, and
+        // McpHttpClient sends on every request — see AppServiceProvider
+        // for where the URL + secret are wired into McpHttpClient.
+        'secret' => env('MCP_SHARED_SECRET'),
+        'url' => env('MCP_URL', 'http://localhost:8000/api/mcp'),
+    ],
+
+    'google_calendar' => [
+        // One shared Google Calendar (not per-user OAuth) — a service
+        // account with "Make changes to events" access on this calendar,
+        // set up manually in Google's own UI. See GoogleCalendarService.
+        // Just a filename — resolved against storage/app/private/ (already
+        // gitignored) in AppServiceProvider, so the key file itself is
+        // never referenced by a path that could accidentally get committed.
+        'credentials_path' => env('GOOGLE_CALENDAR_CREDENTIALS_PATH')
+            ? storage_path('app/private/'.env('GOOGLE_CALENDAR_CREDENTIALS_PATH'))
+            : null,
+        'calendar_id' => env('GOOGLE_CALENDAR_ID'),
+        // Deliberately separate from APP_TIMEZONE (which is UTC) — this is
+        // the real office timezone events should display in on Google's side.
+        'timezone' => env('GOOGLE_CALENDAR_TIMEZONE', 'Asia/Beirut'),
+        'reminder_lead_minutes' => env('CALENDAR_REMINDER_LEAD_MINUTES', 15),
+    ],
+
 ];

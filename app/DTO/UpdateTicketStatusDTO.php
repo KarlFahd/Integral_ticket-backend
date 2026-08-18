@@ -5,13 +5,13 @@ namespace App\DTO;
 final class UpdateTicketStatusDTO
 {
     public function __construct(
-        public readonly string $status,
+        public readonly int $statusId,
     ) {}
 
     public static function fromArray(array $data): self
     {
         return new self(
-            status: $data['status'],
+            statusId: (int) $data['status_id'],
         );
     }
 }

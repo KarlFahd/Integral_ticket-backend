@@ -5,14 +5,17 @@ namespace App\Models;
 // use Illuminate\Contracts\Auth\MustVerifyEmail;
 use Database\Factories\UserFactory;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Laravel\Passport\Contracts\OAuthenticatable;
+use Laravel\Passport\HasApiTokens;
 
-class User extends Authenticatable
+class User extends Authenticatable implements OAuthenticatable
 {
     /** @use HasFactory<UserFactory> */
-    use HasFactory, Notifiable;
+    use HasApiTokens, HasFactory, Notifiable;
 
     /**
      * The attributes that are mass assignable.
@@ -61,5 +64,23 @@ class User extends Authenticatable
     public function ticketNotifications(): HasMany
     {
         return $this->hasMany(TicketNotification::class);
+    }
+
+    /** @return HasMany<Event, $this> */
+    public function createdEvents(): HasMany
+    {
+        return $this->hasMany(Event::class, 'created_by_user_id');
+    }
+
+    /** @return BelongsToMany<Event, $this> */
+    public function eventParticipations(): BelongsToMany
+    {
+        return $this->belongsToMany(Event::class, 'event_participants');
+    }
+
+    /** @return HasMany<EventReminder, $this> */
+    public function eventReminders(): HasMany
+    {
+        return $this->hasMany(EventReminder::class);
     }
 }

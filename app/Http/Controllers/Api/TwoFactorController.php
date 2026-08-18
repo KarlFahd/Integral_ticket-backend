@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
+use App\Support\CalendarColor;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use PragmaRX\Google2FA\Google2FA;
@@ -94,11 +95,12 @@ class TwoFactorController extends Controller
 
         return response()->json([
             'user' => [
-                'id'       => $user->id,
-                'name'     => $user->name,
-                'username' => $user->username,
-                'is_admin' => (bool) $user->is_admin,
-                'is_hr'    => (bool) $user->is_hr,
+                'id'             => $user->id,
+                'name'           => $user->name,
+                'username'       => $user->username,
+                'is_admin'       => (bool) $user->is_admin,
+                'is_hr'          => (bool) $user->is_hr,
+                'calendar_color' => CalendarColor::forUserId($user->id),
             ],
         ]);
     }

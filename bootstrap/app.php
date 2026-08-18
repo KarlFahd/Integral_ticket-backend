@@ -13,7 +13,16 @@ return Application::configure(basePath: dirname(__DIR__))
         health: '/up',
     )
     ->withMiddleware(function (Middleware $middleware): void {
-        //
+        // Trust the Cloudflare tunnel (and any other reverse proxy in front of
+        // this app) to report the real scheme/host via X-Forwarded-* headers.
+        // Without this, Laravel thinks every request is plain HTTP (since
+        // `php artisan serve` itself only ever speaks HTTP), so route()/url()
+        // generate http:// links even when the browser is on https:// — which
+        // is exactly what breaks Passport's OAuth authorize/approve forms
+        // behind the tunnel (browser flags them as insecure, and the
+        // http->https redirect drops the POST body, including the CSRF and
+        // auth tokens).
+        $middleware->trustProxies(at: '*');
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

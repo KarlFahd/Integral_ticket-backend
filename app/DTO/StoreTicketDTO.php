@@ -7,8 +7,8 @@ final class StoreTicketDTO
     public function __construct(
         public readonly string $title,
         public readonly string $description,
-        public readonly string $category,
-        public readonly string $priority,
+        public readonly int $categoryId,
+        public readonly int $priorityId,
         public readonly string $createdBy,
         public readonly ?string $attachment = null,
     ) {}
@@ -18,8 +18,8 @@ final class StoreTicketDTO
         return new self(
             title: $data['title'],
             description: $data['description'],
-            category: $data['category'],
-            priority: $data['priority'],
+            categoryId: (int) $data['category_id'],
+            priorityId: (int) $data['priority_id'],
             createdBy: $data['created_by'],
             attachment: $data['attachment'] ?? null,
         );

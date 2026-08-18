@@ -2,20 +2,27 @@
 
 namespace App\Services;
 
-use App\DTO\StoreMessageDTO;
-use App\DTO\StoreTicketDTO;
-use App\DTO\UpdateTicketStatusDTO;
-use App\Events\MessageSent;
-use App\Events\TicketNotificationCreated;
-use App\Events\TicketUpdated;
-use App\Models\Ticket;
-use App\Models\User;
-use Illuminate\Support\Facades\Hash;
+use App\Services\Mcp\McpHttpClient;
+use App\Services\Mcp\TicketMcpTools;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Validator;
-use Illuminate\Support\Str;
 
+/**
+ * BotService — the agentic loop orchestrator.
+ *
+ * High-level flow for every user message:
+ *   1. Ask the MCP server (McpController) which tools exist.        → listTools()
+ *   2. Translate those tool schemas from MCP format to Gemini format. → mcpToolsToGeminiDeclarations()
+ *   3. Send the full conversation + tools to Gemini.               → callGemini()
+ *   4. If Gemini wants to call a tool:
+ *        a. Execute the tool via the MCP server.                   → mcpClient->callTool()
+ *        b. Append the tool result to the conversation.
+ *        c. Go back to step 3.
+ *   5. If Gemini writes a plain text reply → return it to the caller.
+ *
+ * This is called an "agentic loop" because the model *acts* (calls tools,
+ * reads results, decides the next step) instead of just responding in one shot.
+ */
 class BotService
 {
     // Free-tier Gemini models, tried in order — see https://ai.google.dev/gemini-api/docs/pricing
@@ -25,18 +32,13 @@ class BotService
 
     private const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
 
+    // Safety cap: if the model hasn't produced a final text reply after 6 tool
+    // calls, something is wrong (bad tool descriptions, unexpected model behavior).
+    // We stop and return a fallback message rather than looping forever.
     private const MAX_ITERATIONS = 6;
 
-    private const CATEGORIES = ['Hardware', 'Software', 'Network', 'Account'];
-
-    private const PRIORITIES = ['Low', 'Medium', 'High'];
-
-    private const STATUSES = ['Open', 'Pending', 'In Progress', 'Rejected', 'Resolved'];
-
     public function __construct(
-        private readonly TicketService $ticketService,
-        private readonly TicketMessageService $messageService,
-        private readonly TicketNotificationService $notificationService,
+        private readonly McpHttpClient $mcpClient,
     ) {}
 
     /**
@@ -54,12 +56,28 @@ class BotService
             ];
         }
 
-        $tools = $this->buildTools($isAdmin, $isHr);
+        // Step 1: Ask our MCP server which tools the current user is allowed to use.
+        // The MCP server (McpController → TicketMcpTools::definitions()) filters
+        // the list by role — HR/Admin get create_user and list_users, others don't.
+        $tools = $this->mcpToolsToGeminiDeclarations(
+            $this->mcpClient->listTools($username, $isAdmin, $isHr)
+        );
+
+        // Step 2: Convert our app's message format {role, content} to Gemini's
+        // format {role, parts: [{text}]} and rename "assistant" → "model".
         $contents = $this->toGeminiContents($messages);
+
+        // Actions are side-channel instructions for the frontend (navigate / theme).
+        // We collect them across ALL iterations, not just the last one, because
+        // a single request could theoretically call navigate AND toggle_theme.
         $actions = [];
 
         $systemPrompt = $this->buildSystemPrompt($username, $isAdmin, $isHr);
 
+        // The agentic loop: each iteration = one round-trip to Gemini.
+        // Normal conversations finish in 1-2 iterations.
+        // Complex multi-step requests (e.g. "create a ticket AND open the tickets page")
+        // might use 2-3. We cap at 6 to prevent runaway loops.
         for ($i = 0; $i < self::MAX_ITERATIONS; $i++) {
             $response = $this->callGemini($contents, $tools, $systemPrompt, $apiKey);
 
@@ -82,6 +100,8 @@ class BotService
                 ];
             }
 
+            // Gemini's response is a "candidates" array. We always take [0].
+            // "parts" contains either text blocks OR functionCall blocks (never both at once).
             $parts = $response->json('candidates.0.content.parts', []);
 
             if ($parts === []) {
@@ -91,13 +111,18 @@ class BotService
                 ];
             }
 
+            // Split into function calls vs. text — if there are no function calls,
+            // Gemini is done thinking and has a final answer for the user.
             $functionCalls = array_values(array_filter($parts, fn ($p) => isset($p['functionCall'])));
 
             if ($functionCalls === []) {
+                // EXIT: Gemini wrote a plain reply — extract the text and return it.
                 return ['reply' => $this->extractText($parts), 'actions' => $actions];
             }
 
-            $contents[] = ['role' => 'model', 'parts' => $parts];
+            // CONTINUE: Gemini wants to call tools. Append Gemini's "I want to call
+            // these tools" message to the conversation, then execute each tool.
+            $contents[] = ['role' => 'model', 'parts' => $this->fixEmptyFunctionCallArgs($parts)];
 
             $responseParts = [];
 
@@ -105,12 +130,20 @@ class BotService
                 $name = (string) ($part['functionCall']['name'] ?? '');
                 $args = (array) ($part['functionCall']['args'] ?? []);
 
-                [$resultText, $action] = $this->executeTool($name, $args, $username, $isAdmin, $isHr);
+                // Execute the tool via the MCP server (JSON-RPC tools/call).
+                // The result is {content: [{type, text}], action: ?{type, ...}}.
+                $result = $this->mcpClient->callTool($name, $args, $username, $isAdmin, $isHr);
+
+                // "action" is our app's non-standard extension to MCP — it carries
+                // frontend instructions (navigate, theme) that the text reply alone can't.
+                $resultText = $result['content'][0]['text'] ?? "The {$name} tool didn't return a result.";
+                $action = $result['action'] ?? null;
 
                 if ($action !== null) {
                     $actions[] = $action;
                 }
 
+                // Tell Gemini what the tool returned so it can decide what to do next.
                 $responseParts[] = [
                     'functionResponse' => [
                         'name' => $name,
@@ -119,9 +152,16 @@ class BotService
                 ];
             }
 
+            // Append the tool results as a "user" turn (Gemini's convention —
+            // tool results always come from the "user" role in its multi-turn format).
             $contents[] = ['role' => 'user', 'parts' => $responseParts];
+
+            // Now loop back: Gemini will read the tool results and either call more
+            // tools or produce its final text reply.
         }
 
+        // If we exit the loop without Gemini finishing, it means 6 tool calls happened
+        // and it still hasn't written a text reply — something went wrong.
         return [
             'reply' => "That's taking more steps than expected — could you try rephrasing your request?",
             'actions' => $actions,
@@ -132,6 +172,11 @@ class BotService
      * Tries each model in self::MODELS in order, moving to the next one only
      * when a model reports 503 (overloaded) or the connection itself fails.
      * Returns null only if every model in the list failed.
+     *
+     * The two-model strategy is purely a free-tier availability workaround:
+     * gemini-3.1-flash-lite has very generous limits but can still go 503 under
+     * heavy load. gemini-3.5-flash is the fallback — slower free-tier limits
+     * but more reliable when the lite model is busy.
      *
      * @param  array<int, array<string, mixed>>  $contents
      * @param  array<int, array<string, mixed>>  $tools
@@ -150,12 +195,17 @@ class BotService
                         self::API_BASE.$model.':generateContent?key='.$apiKey,
                         [
                             'contents' => $contents,
+                            // Wrap tools in "functionDeclarations" — Gemini's required shape.
                             'tools' => [['functionDeclarations' => $tools]],
+                            // systemInstruction is sent separately from contents;
+                            // Gemini treats it as always-visible context that doesn't
+                            // appear in the conversation history the model echoes back.
                             'systemInstruction' => ['parts' => ['text' => $systemPrompt]],
                             'generationConfig' => ['maxOutputTokens' => 1024],
                         ],
                     );
             } catch (\Illuminate\Http\Client\ConnectionException $e) {
+                // Network-level failure (DNS, refused connection) — try next model.
                 continue;
             }
 
@@ -171,6 +221,10 @@ class BotService
     }
 
     /**
+     * Gemini uses "user" / "model" roles, but our app (and MCP) uses the
+     * OpenAI convention "user" / "assistant". Rename "assistant" → "model"
+     * and wrap the text in the parts array Gemini expects.
+     *
      * @param  array<int, array{role: string, content: mixed}>  $messages
      * @return array<int, array<string, mixed>>
      */
@@ -182,6 +236,29 @@ class BotService
         ], $messages);
     }
 
+    /**
+     * Pre-existing bug, unrelated to MCP: when Gemini calls a tool with no
+     * arguments, it sends `args: {}`. PHP's JSON decoder has no separate
+     * empty-object type, so that becomes `[]` — and json_encode(`[]`)
+     * produces `[]`, not `{}`, when we echo the call back a turn later.
+     * Gemini's API then rejects it ("Proto field is not repeating, cannot
+     * start list"). Force any empty args array back into `{}` before it's
+     * re-sent.
+     *
+     * @param  array<int, array<string, mixed>>  $parts
+     * @return array<int, array<string, mixed>>
+     */
+    private function fixEmptyFunctionCallArgs(array $parts): array
+    {
+        return array_map(function (array $part) {
+            if (isset($part['functionCall']['args']) && $part['functionCall']['args'] === []) {
+                $part['functionCall']['args'] = new \stdClass;
+            }
+
+            return $part;
+        }, $parts);
+    }
+
     /** @param array<int, array<string, mixed>> $parts */
     private function extractText(array $parts): string
     {
@@ -190,539 +267,86 @@ class BotService
         return $text !== '' ? $text : "I'm not sure how to respond to that.";
     }
 
+    /**
+     * The system prompt is Gemini's "personality brief" — it's sent on every
+     * request (outside of the normal conversation history) and tells the model
+     * who it is, who the current user is, and what rules to follow.
+     * Injecting username + role here means the model won't invent tickets or
+     * users that the current user can't actually see.
+     */
     private function buildSystemPrompt(string $username, bool $isAdmin, bool $isHr): string
     {
         $role = $isAdmin ? 'Admin/Agent' : ($isHr ? 'HR' : 'Employee');
 
+        // create_event needs a real YYYY-MM-DD date, but users say things like
+        // "tomorrow" or "next Monday" — the model has no other way to know
+        // what "today" actually is, so it's injected here explicitly.
+        $tz = config('services.google_calendar.timezone');
+        $today = now($tz)->translatedFormat('l, F j, Y');
+
+        // Generated from TicketMcpTools's constants rather than typed out
+        // here a second time — those constants are the single source of
+        // truth for these four value lists across every MCP surface, so
+        // this prompt can't quietly drift out of sync with the real schema.
+        $categories = implode(', ', TicketMcpTools::CATEGORIES);
+        $priorities = implode(', ', TicketMcpTools::PRIORITIES);
+        $statuses = implode(', ', TicketMcpTools::STATUSES);
+        $eventTypes = implode(', ', TicketMcpTools::EVENT_TYPES);
+
         return <<<PROMPT
         You are "Integral Bot", a helpful in-app assistant for the Integral support ticket system.
         The current user is "{$username}", role: {$role}.
+        Today's date is {$today} (timezone: {$tz}).
 
         Rules:
         - Only use the tools you've been given. If you weren't given a tool for something, say you can't do that — never claim to have done something you didn't actually do.
         - If a tool needs information the user hasn't given you, ask one short, specific clarifying question instead of guessing or calling the tool with made-up values.
-        - Ticket categories are exactly: Hardware, Software, Network, Account.
-        - Ticket priorities are exactly: Low, Medium, High.
-        - Ticket statuses are exactly: Open, Pending, In Progress, Rejected, Resolved.
+        - Ticket categories are exactly: {$categories}.
+        - Ticket priorities are exactly: {$priorities}.
+        - Ticket statuses are exactly: {$statuses}.
+        - Calendar event types are exactly: {$eventTypes}.
+        - When creating a calendar event, work out the actual date yourself from today's date above before calling create_event — never pass relative words like "tomorrow" as the date.
         - Never invent ticket IDs, usernames, or data — only reference what tool results actually return to you.
         - Keep replies short and conversational (one to three sentences), not a report.
         - You only see and act on what the current user is allowed to see and act on in the app itself — don't apologize for that, just work within it.
         PROMPT;
     }
 
-    /** @return array<int, array<string, mixed>> */
-    private function buildTools(bool $isAdmin, bool $isHr): array
-    {
-        $navigateTargets = ['dashboard', 'tickets', 'calendar', '2fa-setup', 'settings', 'create-ticket'];
-
-        if ($isAdmin || $isHr) {
-            $navigateTargets[] = 'users';
-            $navigateTargets[] = 'finance';
-        }
-
-        if ($isAdmin) {
-            $navigateTargets[] = 'history';
-        }
-
-        $tools = [
-            [
-                'name' => 'navigate',
-                'description' => 'Open a page in the app for the user (client-side navigation). '
-                    .'These names match the sidebar labels exactly: "dashboard" is the home/overview page with ticket stats, '
-                    .'"tickets" is the ticket list page, "create-ticket" is the new-ticket form, "2fa-setup" is the two-factor '
-                    .'authentication setup page, "history" is the admin-only archive of resolved tickets (separate from "tickets", '
-                    .'which never shows resolved tickets). "dashboard" and "tickets" are NOT the same page — pick the one the user actually means.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'page' => ['type' => 'string', 'enum' => $navigateTargets],
-                    ],
-                    'required' => ['page'],
-                ],
-            ],
-            [
-                'name' => 'toggle_theme',
-                'description' => 'Switch the app between light and dark mode.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'mode' => ['type' => 'string', 'enum' => ['light', 'dark']],
-                    ],
-                    'required' => ['mode'],
-                ],
-            ],
-            [
-                'name' => 'create_ticket',
-                'description' => 'Create a new support ticket on behalf of the current user. Call this only once you have all four fields.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'title' => ['type' => 'string', 'description' => 'Short ticket title, 3-255 characters.'],
-                        'description' => ['type' => 'string', 'description' => 'Description of the issue, 3-200 characters.'],
-                        'category' => ['type' => 'string', 'enum' => self::CATEGORIES],
-                        'priority' => ['type' => 'string', 'enum' => self::PRIORITIES],
-                    ],
-                    'required' => ['title', 'description', 'category', 'priority'],
-                ],
-            ],
-            [
-                'name' => 'list_tickets',
-                'description' => 'List support tickets visible to the current user, optionally filtered by status.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'status' => [
-                            'type' => 'string',
-                            'enum' => self::STATUSES,
-                            'description' => 'Optional. Omit to list tickets of every status.',
-                        ],
-                    ],
-                ],
-            ],
-            [
-                'name' => 'get_ticket_detail',
-                'description' => 'Get full details for a single ticket by its numeric ID.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'ticket_id' => ['type' => 'integer'],
-                    ],
-                    'required' => ['ticket_id'],
-                ],
-            ],
-            [
-                'name' => 'update_ticket_status',
-                'description' => 'Change the status of a ticket (e.g. close it, mark it resolved).',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'ticket_id' => ['type' => 'integer'],
-                        'status' => ['type' => 'string', 'enum' => self::STATUSES],
-                    ],
-                    'required' => ['ticket_id', 'status'],
-                ],
-            ],
-            [
-                'name' => 'update_ticket_priority',
-                'description' => 'Change the priority of a ticket.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'ticket_id' => ['type' => 'integer'],
-                        'priority' => ['type' => 'string', 'enum' => self::PRIORITIES],
-                    ],
-                    'required' => ['ticket_id', 'priority'],
-                ],
-            ],
-            [
-                'name' => 'reply_to_ticket',
-                'description' => 'Post a reply message on a single ticket.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'ticket_id' => ['type' => 'integer'],
-                        'message' => ['type' => 'string', 'description' => 'Message text, max 1000 characters.'],
-                    ],
-                    'required' => ['ticket_id', 'message'],
-                ],
-            ],
-            [
-                'name' => 'bulk_reply_to_tickets',
-                'description' => 'Post the SAME reply message to every ticket matching the given filters — use this '
-                    .'instead of calling reply_to_ticket once per ticket whenever the user asks to message "all tickets" '
-                    .'matching some condition (e.g. "message every High priority ticket", "send this to all tickets with '
-                    .'ID under 10"). At least one filter (status, priority, min_id, or max_id) is required — refuse and '
-                    .'ask for a filter if the user wants it sent to literally every ticket with no condition at all. '
-                    .'Resolved tickets are always excluded, even if the filters would otherwise match them — they\'re '
-                    .'archived in the History page and considered done, so they never receive bulk messages.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'message' => ['type' => 'string', 'description' => 'Message text, max 1000 characters.'],
-                        'status' => ['type' => 'string', 'enum' => self::STATUSES, 'description' => 'Optional filter: only tickets with this status.'],
-                        'priority' => ['type' => 'string', 'enum' => self::PRIORITIES, 'description' => 'Optional filter: only tickets with this priority.'],
-                        'min_id' => ['type' => 'integer', 'description' => 'Optional filter: only tickets with an ID greater than this.'],
-                        'max_id' => ['type' => 'integer', 'description' => 'Optional filter: only tickets with an ID less than this.'],
-                    ],
-                    'required' => ['message'],
-                ],
-            ],
-        ];
-
-        if ($isAdmin || $isHr) {
-            $tools[] = [
-                'name' => 'create_user',
-                'description' => 'Create a new user account. Only available to HR and Admin roles. A temporary password is generated automatically — never ask the user to type a password.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => [
-                        'name' => ['type' => 'string'],
-                        'username' => ['type' => 'string'],
-                        'email' => ['type' => 'string'],
-                        'is_hr' => ['type' => 'boolean', 'description' => 'Grant HR access. Defaults to false.'],
-                        'is_admin' => ['type' => 'boolean', 'description' => 'Grant Admin/Agent access. Defaults to false.'],
-                    ],
-                    'required' => ['name', 'username', 'email'],
-                ],
-            ];
-
-            $tools[] = [
-                'name' => 'list_users',
-                'description' => 'List all user accounts and their roles. Only available to HR and Admin roles.',
-                'parameters' => [
-                    'type' => 'object',
-                    'properties' => new \stdClass,
-                ],
-            ];
-        }
-
-        return $tools;
-    }
-
     /**
-     * @param  array<string, mixed>  $input
-     * @return array{0: string, 1: ?array<string, mixed>}
+     * MCP and Gemini both describe tools using JSON Schema, but they disagree
+     * on one field name: MCP calls the argument schema "inputSchema", Gemini
+     * calls it "parameters". This function renames that one field.
+     *
+     * This is the ONLY Gemini-specific code in the whole MCP layer. If we ever
+     * switch to a different AI model (Claude, GPT-4, ...), this is the one
+     * function to update — everything else (McpHttpClient, McpController,
+     * TicketMcpTools) is model-agnostic standard MCP.
+     *
+     * @param  array<int, array<string, mixed>>  $mcpTools
+     * @return array<int, array<string, mixed>>
      */
-    private function executeTool(string $name, array $input, string $username, bool $isAdmin, bool $isHr): array
+    private function mcpToolsToGeminiDeclarations(array $mcpTools): array
     {
-        return match ($name) {
-            'navigate' => $this->toolNavigate($input, $isAdmin),
-            'toggle_theme' => $this->toolToggleTheme($input),
-            'create_ticket' => $this->toolCreateTicket($input, $username),
-            'list_tickets' => $this->toolListTickets($input, $username, $isAdmin),
-            'get_ticket_detail' => $this->toolGetTicketDetail($input, $username, $isAdmin),
-            'update_ticket_status' => $this->toolUpdateTicketStatus($input, $username, $isAdmin),
-            'update_ticket_priority' => $this->toolUpdateTicketPriority($input, $username, $isAdmin),
-            'reply_to_ticket' => $this->toolReplyToTicket($input, $username, $isAdmin),
-            'bulk_reply_to_tickets' => $this->toolBulkReplyToTickets($input, $username, $isAdmin),
-            'create_user' => ($isAdmin || $isHr)
-                ? $this->toolCreateUser($input)
-                : ['You do not have permission to create users.', null],
-            'list_users' => ($isAdmin || $isHr)
-                ? $this->toolListUsers()
-                : ['You do not have permission to view users.', null],
-            default => ["Unknown tool: {$name}", null],
-        };
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolNavigate(array $input, bool $isAdmin): array
-    {
-        // Keys match the sidebar's own labels exactly — NOT the raw route
-        // path segments, which are named inconsistently in this app (the
-        // sidebar's "Dashboard" link goes to /overview, and its "Tickets"
-        // link goes to /dashboard or /agent-dashboard).
-        $routes = [
-            'dashboard' => '/overview',
-            'tickets' => $isAdmin ? '/agent-dashboard' : '/dashboard',
-            'calendar' => '/calendar',
-            '2fa-setup' => '/setup-2fa',
-            'settings' => '/settings',
-            'create-ticket' => '/create-ticket',
-            'users' => '/users',
-            'finance' => '/finance',
-            'history' => '/history',
-        ];
-
-        $page = (string) ($input['page'] ?? '');
-
-        if (! isset($routes[$page])) {
-            return ["That page doesn't exist or you don't have access to it.", null];
-        }
-
-        return ["Opening {$page}.", ['type' => 'navigate', 'path' => $routes[$page]]];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolToggleTheme(array $input): array
-    {
-        $mode = (string) ($input['mode'] ?? '');
-
-        if (! in_array($mode, ['light', 'dark'], true)) {
-            return ['Invalid theme mode.', null];
-        }
-
-        return ["Switched to {$mode} mode.", ['type' => 'theme', 'mode' => $mode]];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolCreateTicket(array $input, string $username): array
-    {
-        $validator = Validator::make($input, [
-            'title' => ['required', 'string', 'min:3', 'max:255'],
-            'description' => ['required', 'string', 'min:3', 'max:200'],
-            'category' => ['required', 'string', 'in:'.implode(',', self::CATEGORIES)],
-            'priority' => ['required', 'string', 'in:'.implode(',', self::PRIORITIES)],
-        ]);
-
-        if ($validator->fails()) {
-            return [$this->firstError($validator), null];
-        }
-
-        $dto = StoreTicketDTO::fromArray([
-            ...$validator->validated(),
-            'created_by' => $username,
-        ]);
-
-        $ticket = $this->ticketService->createTicket($dto);
-
-        return ["Created ticket #{$ticket->id}: \"{$ticket->title}\" ({$ticket->category}, {$ticket->priority} priority, status Open).", null];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolListTickets(array $input, string $username, bool $isAdmin): array
-    {
-        $tickets = $this->ticketService->getAllTickets();
-
-        if (! $isAdmin) {
-            $tickets = $tickets->where('created_by', $username);
-        }
-
-        $status = $input['status'] ?? null;
-        if (is_string($status) && $status !== '') {
-            $tickets = $tickets->where('status', $status);
-        }
-
-        if ($tickets->isEmpty()) {
-            return ['No tickets found.', null];
-        }
-
-        $lines = $tickets->take(20)->map(
-            fn (Ticket $t) => "#{$t->id} \"{$t->title}\" — {$t->status}, {$t->priority} priority, {$t->category}, created by {$t->created_by}"
-        )->implode("\n");
-
-        return [$lines, null];
-    }
-
-    private function findScopedTicket(int $ticketId, string $username, bool $isAdmin): ?Ticket
-    {
-        $ticket = $this->ticketService->getTicketById($ticketId);
-
-        if ($ticket === null) {
-            return null;
-        }
-
-        if (! $isAdmin && $ticket->created_by !== $username) {
-            return null;
-        }
-
-        return $ticket;
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolGetTicketDetail(array $input, string $username, bool $isAdmin): array
-    {
-        $ticket = $this->findScopedTicket((int) ($input['ticket_id'] ?? 0), $username, $isAdmin);
-
-        if ($ticket === null) {
-            return ["Ticket not found (or you don't have access to it).", null];
-        }
-
-        return [
-            "Ticket #{$ticket->id}: \"{$ticket->title}\"\n".
-            "Status: {$ticket->status}\n".
-            "Priority: {$ticket->priority}\n".
-            "Category: {$ticket->category}\n".
-            "Created by: {$ticket->created_by}\n".
-            "Description: {$ticket->description}",
-            null,
-        ];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolUpdateTicketStatus(array $input, string $username, bool $isAdmin): array
-    {
-        $ticket = $this->findScopedTicket((int) ($input['ticket_id'] ?? 0), $username, $isAdmin);
-
-        if ($ticket === null) {
-            return ["Ticket not found (or you don't have access to it).", null];
-        }
-
-        $status = (string) ($input['status'] ?? '');
-        if (! in_array($status, self::STATUSES, true)) {
-            return ['Invalid status value.', null];
-        }
-
-        $updated = $this->ticketService->updateTicketStatus($ticket, UpdateTicketStatusDTO::fromArray(['status' => $status]));
-        broadcast(new TicketUpdated($updated));
-
-        return ["Ticket #{$updated->id} status updated to {$updated->status}.", null];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolUpdateTicketPriority(array $input, string $username, bool $isAdmin): array
-    {
-        $ticket = $this->findScopedTicket((int) ($input['ticket_id'] ?? 0), $username, $isAdmin);
-
-        if ($ticket === null) {
-            return ["Ticket not found (or you don't have access to it).", null];
-        }
-
-        $priority = (string) ($input['priority'] ?? '');
-        if (! in_array($priority, self::PRIORITIES, true)) {
-            return ['Invalid priority value.', null];
-        }
-
-        $updated = $this->ticketService->updateTicketPriority($ticket, $priority);
-        broadcast(new TicketUpdated($updated));
-
-        return ["Ticket #{$updated->id} priority updated to {$updated->priority}.", null];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolReplyToTicket(array $input, string $username, bool $isAdmin): array
-    {
-        $ticket = $this->findScopedTicket((int) ($input['ticket_id'] ?? 0), $username, $isAdmin);
-
-        if ($ticket === null) {
-            return ["Ticket not found (or you don't have access to it).", null];
-        }
-
-        $validator = Validator::make($input, [
-            'message' => ['required', 'string', 'max:1000'],
-        ]);
-
-        if ($validator->fails()) {
-            return [$this->firstError($validator), null];
-        }
-
-        $this->postTicketMessage($ticket, $username, $isAdmin, $validator->validated()['message']);
-
-        return ["Reply posted on ticket #{$ticket->id}.", null];
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolBulkReplyToTickets(array $input, string $username, bool $isAdmin): array
-    {
-        $validator = Validator::make($input, [
-            'message' => ['required', 'string', 'max:1000'],
-            'status' => ['nullable', 'string', 'in:'.implode(',', self::STATUSES)],
-            'priority' => ['nullable', 'string', 'in:'.implode(',', self::PRIORITIES)],
-            'min_id' => ['nullable', 'integer'],
-            'max_id' => ['nullable', 'integer'],
-        ]);
-
-        if ($validator->fails()) {
-            return [$this->firstError($validator), null];
-        }
-
-        $data = $validator->validated();
-
-        if (! isset($data['status']) && ! isset($data['priority']) && ! isset($data['min_id']) && ! isset($data['max_id'])) {
-            return ['Please give me at least one filter (status, priority, or a ticket ID range) so I know which tickets to message — I won\'t broadcast to every single ticket.', null];
-        }
-
-        $tickets = $this->ticketService->getAllTickets();
-
-        // Resolved tickets are archived in the History page — they're done,
-        // so bulk messages never target them even if a filter would otherwise match.
-        $tickets = $tickets->where('status', '!=', 'Resolved');
-
-        if (! $isAdmin) {
-            $tickets = $tickets->where('created_by', $username);
-        }
-
-        if (isset($data['status'])) {
-            $tickets = $tickets->where('status', $data['status']);
-        }
-
-        if (isset($data['priority'])) {
-            $tickets = $tickets->where('priority', $data['priority']);
-        }
-
-        if (isset($data['min_id'])) {
-            $tickets = $tickets->where('id', '>', $data['min_id']);
-        }
-
-        if (isset($data['max_id'])) {
-            $tickets = $tickets->where('id', '<', $data['max_id']);
-        }
-
-        if ($tickets->isEmpty()) {
-            return ['No tickets matched those filters — nothing was sent.', null];
-        }
-
-        $tickets = $tickets->take(50);
-
-        foreach ($tickets as $ticket) {
-            $this->postTicketMessage($ticket, $username, $isAdmin, $data['message']);
-        }
-
-        $count = $tickets->count();
-
-        return ["Sent the message to {$count} ticket".($count === 1 ? '' : 's').': '.$tickets->map(fn (Ticket $t) => "#{$t->id}")->implode(', ').'.', null];
-    }
-
-    private function postTicketMessage(Ticket $ticket, string $username, bool $isAdmin, string $text): void
-    {
-        $dto = StoreMessageDTO::fromArray([
-            'sender' => $username,
-            'is_agent' => $isAdmin,
-            'message' => $text,
-        ]);
-
-        $message = $this->messageService->createMessage($ticket->id, $dto);
-
-        broadcast(new MessageSent($message))->toOthers();
-
-        $notifications = $this->notificationService->notifyForNewMessage($message, $ticket);
-        foreach ($notifications as $notification) {
-            broadcast(new TicketNotificationCreated($notification, $notification->user->username));
-        }
-    }
-
-    /** @param array<string, mixed> $input */
-    private function toolCreateUser(array $input): array
-    {
-        $validator = Validator::make($input, [
-            'name' => ['required', 'string', 'max:100'],
-            'username' => ['required', 'string', 'max:50', 'unique:users,username'],
-            'email' => ['required', 'email', 'unique:users,email'],
-            'is_hr' => ['boolean'],
-            'is_admin' => ['boolean'],
-        ]);
-
-        if ($validator->fails()) {
-            return [$this->firstError($validator), null];
-        }
-
-        $data = $validator->validated();
-        $password = Str::random(12);
-
-        $user = User::create([
-            'name' => $data['name'],
-            'username' => $data['username'],
-            'email' => $data['email'],
-            'password' => Hash::make($password),
-            'is_admin' => $data['is_admin'] ?? false,
-            'is_hr' => $data['is_hr'] ?? false,
-        ]);
-
-        return [
-            "Created user \"{$user->username}\" ({$user->name}). Temporary password: {$password} — share this with them securely, they should change it after first login.",
-            null,
-        ];
-    }
-
-    private function toolListUsers(): array
-    {
-        $users = User::orderBy('name')->get();
-
-        if ($users->isEmpty()) {
-            return ['No users found.', null];
-        }
-
-        $lines = $users->map(function (User $u) {
-            $role = $u->is_admin ? 'Admin' : ($u->is_hr ? 'HR' : 'Employee');
-
-            return "{$u->name} (@{$u->username}) — {$role}";
-        })->implode("\n");
-
-        return [$lines, null];
-    }
-
-    private function firstError(\Illuminate\Contracts\Validation\Validator $validator): string
-    {
-        return (string) collect($validator->errors()->all())->first();
+        return array_map(function (array $tool) {
+            $schema = $tool['inputSchema'];
+
+            // Same empty-object-vs-empty-array issue as
+            // fixEmptyFunctionCallArgs(), on a different seam: a no-argument
+            // tool's `properties: {}` gets decoded into PHP `[]` by
+            // McpHttpClient (Laravel's Response::json() uses associative-
+            // array mode), then re-encoded as `[]` instead of `{}` when we
+            // send it on to Gemini, which rejects it as "Cannot bind a list
+            // to map for field 'properties'". Force it back to an object.
+            if (isset($schema['properties']) && $schema['properties'] === []) {
+                $schema['properties'] = new \stdClass;
+            }
+
+            return [
+                'name' => $tool['name'],
+                'description' => $tool['description'],
+                // Rename: MCP "inputSchema" → Gemini "parameters"
+                'parameters' => $schema,
+            ];
+        }, $mcpTools);
     }
 }

@@ -17,7 +17,7 @@ interface TicketRepositoryInterface
 
     public function updateStatus(Ticket $ticket, UpdateTicketStatusDTO $dto): Ticket;
 
-    public function updatePriority(Ticket $ticket, string $priority): Ticket;
+    public function updatePriority(Ticket $ticket, int $priorityId): Ticket;
 
     public function delete(Ticket $ticket): void;
 }

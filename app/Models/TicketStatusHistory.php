@@ -11,8 +11,8 @@ class TicketStatusHistory extends Model
 
     protected $fillable = [
         'ticket_id',
-        'old_status',
-        'new_status',
+        'old_status_id',
+        'new_status_id',
         'changed_at',
     ];
 
@@ -23,5 +23,17 @@ class TicketStatusHistory extends Model
     public function ticket(): BelongsTo
     {
         return $this->belongsTo(Ticket::class);
+    }
+
+    /** @return BelongsTo<Status, $this> */
+    public function oldStatus(): BelongsTo
+    {
+        return $this->belongsTo(Status::class, 'old_status_id');
+    }
+
+    /** @return BelongsTo<Status, $this> */
+    public function newStatus(): BelongsTo
+    {
+        return $this->belongsTo(Status::class, 'new_status_id');
     }
 }

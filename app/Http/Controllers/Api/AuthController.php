@@ -5,6 +5,7 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Http\Requests\LoginRequest;
 use App\Models\User;
+use App\Support\CalendarColor;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Hash;
 
@@ -28,11 +29,12 @@ class AuthController extends Controller
 
         return response()->json([
             'user' => [
-                'id'       => $user->id,
-                'name'     => $user->name,
-                'username' => $user->username,
-                'is_admin' => (bool) $user->is_admin,
-                'is_hr'    => (bool) $user->is_hr,
+                'id'             => $user->id,
+                'name'           => $user->name,
+                'username'       => $user->username,
+                'is_admin'       => (bool) $user->is_admin,
+                'is_hr'          => (bool) $user->is_hr,
+                'calendar_color' => CalendarColor::forUserId($user->id),
             ],
         ]);
     }

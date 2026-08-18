@@ -73,7 +73,7 @@ class TicketController extends Controller
 
         $updated = $this->ticketService->updateTicketPriority(
             $ticket,
-            $request->validated()['priority']
+            (int) $request->validated()['priority_id']
         );
 
         broadcast(new TicketUpdated($updated));
